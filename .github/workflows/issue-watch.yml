@@ -38,11 +38,25 @@ jobs:
         with:
           node-version: '22'
 
+      # The alert-dedup ledger has to OUTLIVE THE RUNNER or it is not a ledger. It previously lived
+      # at ${{ runner.temp }}, which GitHub wipes between jobs — so every scheduled run loaded an
+      # empty state, re-classified every open issue as a first sighting, and re-paged it (2026-08-17).
+      # The 4h cooldown the script documents has never once been honoured in CI. Cached under the
+      # script's own default path so the workflow no longer overrides where state lives at all.
+      # run_id keys are unique (a cache key is immutable once written), so each run saves a fresh
+      # entry and restore-keys picks up the most recent one.
+      - name: Restore issue-watch alert state
+        uses: actions/cache@v4
+        with:
+          path: ~/.claude/ruvnet-brain
+          key: issue-watch-state-${{ github.run_id }}
+          restore-keys: |
+            issue-watch-state-
+
       - name: Check open issues + 4h SLA
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}      # gh CLI auth (pre-installed on the runner)
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}       # optional: phone push on breach; absent -> still logs + warns
-          ISSUE_WATCH_STATE: ${{ runner.temp }}/issue-watch-state.json
         run: |
           set -o pipefail
           node scripts/issue-watch.mjs 2>&1 | tee "$RUNNER_TEMP/watch.out"
