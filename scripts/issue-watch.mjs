@@ -46,6 +46,15 @@ export const OWNER_LOGIN = 'stuinfla';
 // moved here.)
 export const BOT_MARKER = '🤖 Automated';
 const SLA_HOURS = 4;
+// An alert can go undelivered for two reasons that are NOT the same thing, and conflating them is
+// what failed ~100 consecutive scheduled runs (2026-08-17). "No topic configured" is a PERMANENT,
+// known state of the world — alerting was never wired up — so it is a skip, not a failure, and no
+// number of retries can make it succeed. A push that was actually ATTEMPTED and failed is a real
+// execution failure and must still exit 1 (F5 — see the exit note at the bottom of run()).
+export const NO_CHANNEL_REASON = 'no ntfy topic configured';
+// The attempted-and-failed case. Distinct from NO_CHANNEL_REASON so the exit check below can tell
+// them apart, and so the log says which one happened instead of the bare "(null)" it used to print.
+export const PUSH_FAILED_REASON = 'ntfy push failed';
 const STATE_PATH = process.env.ISSUE_WATCH_STATE
   || path.join(os.homedir(), '.claude', 'ruvnet-brain', 'issue-watch-state.json');
 // A compact, always-current snapshot the SessionStart hook surfaces (2026-07-17). ntfy alerts are
@@ -175,8 +184,12 @@ export async function run({ dryRun = false, now = Date.now(), repo = REPO } = {}
         const ackBody = `🤖 Automated acknowledgment — received and opened. The maintainer has been paged and this is being worked. The next update here will be a fix, findings, or the maintainer in person.`;
         const ack = spawnSync(GH_BIN, ['issue', 'comment', String(issue.number), '--repo', repo, '--body', ackBody], { encoding: 'utf8' });
         if (ack.status === 0) ackAt = new Date(now).toISOString();
-        if (sent || ackAt) state[key] = { firstSeenAt: new Date(now).toISOString(), ...(sent ? { newAlertAt: new Date(now).toISOString() } : {}), ...(ackAt ? { ackAt } : {}), title: issue.title, url };
-        alertsSent.push({ number: issue.number, sent, acked: Boolean(ackAt), kind: 'new-issue', reason: topic ? null : 'no ntfy topic configured' });
+        // Record the sighting when SOMETHING landed (page or ack) — or when there is no channel at
+        // all to land on. That last clause is the 2026-08-17 fix: delivery-derived state assumes a
+        // retry can eventually succeed, which is true for a down ntfy and false for an unconfigured
+        // one. Without it every run re-sees the issue as brand new, re-pages, and re-fails forever.
+        if (sent || ackAt || !topic) state[key] = { firstSeenAt: new Date(now).toISOString(), ...(sent ? { newAlertAt: new Date(now).toISOString() } : {}), ...(ackAt ? { ackAt } : {}), title: issue.title, url };
+        alertsSent.push({ number: issue.number, sent, acked: Boolean(ackAt), kind: 'new-issue', reason: !topic ? NO_CHANNEL_REASON : sent ? null : PUSH_FAILED_REASON });
       }
     }
 
@@ -199,7 +212,7 @@ export async function run({ dryRun = false, now = Date.now(), repo = REPO } = {}
         // state-erasure class that broke issue-fix's comment dedup, 2026-07-24).
         if (sent) state[key] = { ...(state[key] || {}), lastAlertAt: new Date(now).toISOString(), title: issue.title, url };
         else state[key] = { ...(state[key] || {}), lastAttemptAt: new Date(now).toISOString(), sent: false, title: issue.title, url };
-        alertsSent.push({ number: issue.number, sent, kind: 'sla-breach', reason: topic ? null : 'no ntfy topic configured' });
+        alertsSent.push({ number: issue.number, sent, kind: 'sla-breach', reason: !topic ? NO_CHANNEL_REASON : sent ? null : PUSH_FAILED_REASON });
       }
     }
   }
@@ -269,7 +282,14 @@ async function main() {
   // page, and if the page didn't go out, "ok" would be asserted, not derived. Exit 1 so the
   // heartbeat records the failure and the wrapper's own channel escalates — that duplicate-looking
   // page IS the correct behavior when the primary page provably never left the building.
-  const undeliveredAlert = !dryRun && (output.alertsSent || []).some((a) => !a.sent && a.reason !== 'dry-run');
+  // ...but "undelivered" means a page that was ATTEMPTED and did not arrive. An unconfigured topic
+  // was never attempted: nothing failed, the channel simply does not exist, and the workflow's own
+  // breach step is the documented fallback for exactly that case (issue-watch.yml, "absent -> still
+  // logs + warns"). Counting it here is what made every scheduled run since 2026-08-04 fail with a
+  // clean, correct, no-breach report in its own log — ~100 red runs asserting a failure that never
+  // happened. A real push that 500s or times out still exits 1, which is the property F5 protects.
+  const undeliveredAlert = !dryRun && (output.alertsSent || [])
+    .some((a) => !a.sent && a.reason !== 'dry-run' && a.reason !== NO_CHANNEL_REASON);
   process.exit(undeliveredAlert ? 1 : 0);
 }
 
